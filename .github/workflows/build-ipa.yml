@@ -46,7 +46,7 @@ jobs:
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           latest_tag="$(
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
+            gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 \
               --json tagName --jq '.[0].tagName // ""'
           )"
           if [[ "$FORCE_REBUILD" == "true" ]]; then
@@ -90,10 +90,10 @@ jobs:
           flutter-version: 3.50.0
           cache: true
           cache-key: ${{ runner.os }}-flutter-3.50.0
-          pub-cache-key: ${{ runner.os }}-pub-${{ hashFiles('src/pubspec.lock') }}
 
-      - name: Cache Rust toolchain and native assets
-        uses: actions/cache@v4
+      - name: Restore Rust toolchain and native assets cache
+        id: cache-rust
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -104,16 +104,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-native-
 
-      - name: Cache incremental build_runner outputs
-        uses: actions/cache@v4
+      - name: Restore incremental build_runner cache
+        id: cache-codegen
+        uses: actions/cache/restore@v4
         with:
           path: src/.dart_tool/build
           key: ${{ runner.os }}-build-runner-${{ needs.check-upstream.outputs.sha }}
           restore-keys: |
             ${{ runner.os }}-build-runner-
 
-      - name: Cache Xcode DerivedData, SPM, and CocoaPods
-        uses: actions/cache@v4
+      - name: Restore Xcode DerivedData, SPM, and CocoaPods cache
+        id: cache-xcode
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -145,6 +147,36 @@ jobs:
       - name: Prune Xcode build logs before cache save
         run: rm -rf ~/Library/Developer/Xcode/DerivedData/*/Logs ~/Library/Developer/Xcode/DerivedData/*/Index.noindex
 
+      # Save caches immediately after compilation so a release upload blip can never discard them
+      - name: Save Rust toolchain and native assets cache
+        if: steps.cache-rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            src/.dart_tool/hooks_runner
+          key: ${{ runner.os }}-rust-native-${{ hashFiles('src/fluxer/Cargo.lock', 'src/fluxer/rust-toolchain.toml', 'src/pubspec.lock') }}
+
+      - name: Save incremental build_runner cache
+        if: steps.cache-codegen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: src/.dart_tool/build
+          key: ${{ runner.os }}-build-runner-${{ needs.check-upstream.outputs.sha }}
+
+      - name: Save Xcode DerivedData, SPM, and CocoaPods cache
+        if: steps.cache-xcode.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+            ~/Library/Caches/CocoaPods
+            src/ios/Pods
+          key: ${{ runner.os }}-xcode-spm-${{ hashFiles('src/ios/Podfile.lock', 'src/pubspec.lock', 'src/ios/Runner.xcodeproj/project.pbxproj') }}
+
       - name: Ad-hoc sign & package IPAs (Feather + SideStore)
         env:
           UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
@@ -174,24 +206,37 @@ jobs:
           Both IPAs are ad-hoc signed with normalized permissions and thinned to \`arm64\`; sign with your own certificate or sideloading tool before installing.
           EOF
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" \
-              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
-              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
-              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
-          else
+          # Create release without assets first, then upload with --clobber so retries never hit HTTP 422
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$tag" \
-              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
-              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
-              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "Fluxer iOS - $short_sha" \
               --notes-file "$notes_file"
+          else
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --title "Fluxer iOS - $short_sha" \
+              --notes-file "$notes_file"
           fi
+
+          for attempt in 1 2 3; do
+            if gh release upload "$tag" \
+              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
+              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Failed to upload release assets after 3 attempts."
+              exit 1
+            fi
+            echo "Release asset upload failed (attempt $attempt); retrying in 10s..."
+            sleep 10
+          done
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
