@@ -1,0 +1,144 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "13 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fluxer-ios-build
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    name: Check for upstream changes
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      update: ${{ steps.upstream.outputs.update }}
+    steps:
+      - name: Check upstream main
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote https://github.com/fluxerapp/flutter_client.git refs/heads/main | cut -f1)"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve upstream main commit."
+            exit 1
+          fi
+          tag="fluxer-$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          latest_tag="$(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
+              --json tagName --jq '.[0].tagName // ""'
+          )"
+          if [[ "$latest_tag" == "$tag" ]]; then
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream $sha already has a release."
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "Building upstream $sha."
+          fi
+
+  build:
+    name: Build and publish IPA
+    needs: check-upstream
+    if: needs.check-upstream.outputs.update == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Check out Fluxer
+        uses: actions/checkout@v4
+        with:
+          repository: fluxerapp/flutter_client
+          ref: ${{ needs.check-upstream.outputs.sha }}
+          path: src
+          submodules: recursive
+
+      - name: Select Xcode
+        run: xcodebuild -version
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.50.0
+          cache: true
+          cache-key: ${{ runner.os }}-flutter-3.50.0-${{ hashFiles('src/pubspec.lock') }}
+
+      - name: Cache CocoaPods and Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            src/ios/Pods
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/fluxer/target
+          key: ${{ runner.os }}-ios-${{ hashFiles('src/ios/Podfile.lock', 'src/fluxer/Cargo.lock', 'src/fluxer/rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-ios-
+
+      - name: Set up Rust native assets
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          (cd src/fluxer && rustup toolchain install && rustup target add aarch64-apple-ios)
+          flutter config --enable-native-assets
+
+      - name: Configure iOS build and fetch dependencies
+        working-directory: src
+        run: |
+          dart tool/configure_build.dart --profile=ios-store
+          flutter pub get
+          dart run build_runner build
+
+      - name: Build unsigned iOS app
+        working-directory: src
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        env:
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          app="src/build/ios/iphoneos/Runner.app"
+          test -d "$app" || { echo "::error::Expected app bundle not found: $app"; exit 1; }
+          if /usr/bin/codesign -dv "$app" 2>&1 | grep -q '^Signature='; then
+            echo "::error::Expected an unsigned app bundle, but a signature was found."
+            exit 1
+          fi
+          package="$RUNNER_TEMP/ipa"
+          mkdir -p "$package/Payload"
+          ditto "$app" "$package/Payload/Runner.app"
+          (cd "$package" && /usr/bin/zip -qry -X "$RUNNER_TEMP/fluxer-unsigned.ipa" Payload)
+          /usr/bin/unzip -Z1 "$RUNNER_TEMP/fluxer-unsigned.ipa" | grep -Fxq 'Payload/Runner.app/Info.plist'
+          echo "Built from fluxerapp/flutter_client@$UPSTREAM_SHA" > "$RUNNER_TEMP/upstream-commit.txt"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="fluxer-$UPSTREAM_SHA"
+          short_sha="${UPSTREAM_SHA:0:12}"
+          gh release create "$tag" \
+            "$RUNNER_TEMP/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+            "$RUNNER_TEMP/upstream-commit.txt#upstream-commit.txt" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Fluxer iOS - $short_sha" \
+            --notes "Automatically built from [fluxerapp/flutter_client@$UPSTREAM_SHA](https://github.com/fluxerapp/flutter_client/commit/$UPSTREAM_SHA). The IPA is unsigned and must be signed before installation."
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxer-unsigned-ipa
+          path: ${{ runner.temp }}/fluxer-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
