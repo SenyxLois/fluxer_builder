@@ -14,6 +14,7 @@ API_BASE = "https://api.codemagic.io"
 TERMINAL_STATUSES = {"finished", "failed", "canceled", "timeout", "skipped"}
 
 STATUS_ICON = {
+    "waiting": "⏳",
     "queued": "⏳",
     "initializing": "🔄",
     "fetching": "📥",
@@ -33,7 +34,7 @@ STATUS_ICON = {
 }
 
 
-def api_request(method: str, url: str, token: str, payload=None, retries: int = 4):
+def api_request(method: str, url: str, token: str, payload=None, retries: int = 5, retry_statuses=(429, 500, 502, 503, 504)):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"x-auth-token": token}
     if data is not None:
@@ -47,13 +48,13 @@ def api_request(method: str, url: str, token: str, payload=None, retries: int = 
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as err:
             body = err.read().decode("utf-8", errors="replace")
-            if err.code >= 500 and attempt < retries:
-                time.sleep(attempt * 3)
+            if (err.code >= 500 or err.code in retry_statuses) and attempt < retries:
+                time.sleep(min(attempt * 3, 15))
                 continue
             raise RuntimeError(f"Codemagic API {method} {url} -> HTTP {err.code}: {body}") from err
         except urllib.error.URLError as err:
             if attempt < retries:
-                time.sleep(attempt * 3)
+                time.sleep(min(attempt * 3, 15))
                 continue
             raise RuntimeError(f"Codemagic API {method} {url} failed: {err}") from err
     raise RuntimeError(f"Codemagic API {method} {url} exhausted retries")
@@ -120,29 +121,38 @@ def main() -> int:
     out_dir = Path(os.environ["OUTPUT_DIR"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Triggering Codemagic workflow '{workflow_id}' on mac_mini_m2 for Fluxer {upstream_sha[:12]}...", flush=True)
-    trigger_resp = api_request(
-        "POST",
-        f"{API_BASE}/builds",
-        token,
-        payload={
-            "appId": app_id,
-            "workflowId": workflow_id,
-            "branch": builder_branch,
-            "environment": {
-                "variables": {
-                    "UPSTREAM_BRANCH": upstream_branch,
-                    "UPSTREAM_SHA": upstream_sha,
-                }
+    existing_build_id = os.environ.get("CODEMAGIC_BUILD_ID", "").strip()
+    if existing_build_id:
+        build_id = existing_build_id
+        print(f"Attaching to existing Codemagic build: {build_id}", flush=True)
+    else:
+        print(f"Triggering Codemagic workflow '{workflow_id}' on mac_mini_m2 for Fluxer {upstream_sha[:12]}...", flush=True)
+        trigger_resp = api_request(
+            "POST",
+            f"{API_BASE}/builds",
+            token,
+            payload={
+                "appId": app_id,
+                "workflowId": workflow_id,
+                "branch": builder_branch,
+                "environment": {
+                    "variables": {
+                        "UPSTREAM_BRANCH": upstream_branch,
+                        "UPSTREAM_SHA": upstream_sha,
+                    }
+                },
             },
-        },
-    )
-    build_id = trigger_resp.get("buildId") or trigger_resp.get("_id")
-    if not build_id:
-        raise RuntimeError(f"Unexpected Codemagic response (missing buildId): {trigger_resp}")
+        )
+        build_id = trigger_resp.get("buildId") or trigger_resp.get("_id")
+        if not build_id:
+            raise RuntimeError(f"Unexpected Codemagic response (missing buildId): {trigger_resp}")
 
     build_url = f"https://codemagic.io/app/{app_id}/build/{build_id}"
-    print(f"Codemagic build started: {build_url}", flush=True)
+    print(f"Codemagic build URL: {build_url}", flush=True)
+
+    # Give Codemagic a moment to make the newly created build readable on GET /builds/{id}
+    if not existing_build_id:
+        time.sleep(4)
 
     start_time = time.monotonic()
     last_build_status = None
@@ -150,7 +160,14 @@ def main() -> int:
     build_obj = {}
 
     while True:
-        poll = api_request("GET", f"{API_BASE}/builds/{build_id}", token)
+        # Retry 404 briefly right after creation (Codemagic eventual consistency)
+        poll = api_request(
+            "GET",
+            f"{API_BASE}/builds/{build_id}",
+            token,
+            retries=8,
+            retry_statuses=(404, 429, 500, 502, 503, 504),
+        )
         build_obj = poll.get("build") or poll
         status = (build_obj.get("status") or "unknown").lower()
         actions = build_obj.get("buildActions") or []
