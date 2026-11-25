@@ -9,8 +9,6 @@ workflows:
       cocoapods: default
       vars:
         UPSTREAM_REPO: "fluxerapp/flutter_client"
-        UPSTREAM_BRANCH: ""
-        UPSTREAM_SHA: ""
         COCOAPODS_DISABLE_STATS: "true"
     cache:
       cache_paths:
