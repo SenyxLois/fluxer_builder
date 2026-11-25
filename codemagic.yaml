@@ -1,0 +1,100 @@
+workflows:
+  fluxer-ios-unsigned:
+    name: Fluxer Unsigned iOS IPA (8-Core M2)
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      flutter: 3.50.0
+      xcode: latest
+      cocoapods: default
+      vars:
+        UPSTREAM_REPO: "fluxerapp/flutter_client"
+        UPSTREAM_BRANCH: ""
+        UPSTREAM_SHA: ""
+        COCOAPODS_DISABLE_STATS: "true"
+    cache:
+      cache_paths:
+        - $HOME/.pub-cache
+        - $HOME/.cargo/registry
+        - $HOME/.cargo/git
+        - $HOME/.rustup/toolchains
+        - $HOME/Library/Caches/org.swift.swiftpm
+        - $HOME/Library/Caches/CocoaPods
+        - $CM_BUILD_DIR/src/.dart_tool/build
+        - $CM_BUILD_DIR/src/.dart_tool/hooks_runner
+    scripts:
+      - name: Resolve upstream Fluxer commit
+        script: |
+          set -euo pipefail
+          if [ -z "${UPSTREAM_BRANCH:-}" ]; then
+            UPSTREAM_BRANCH="$(curl -fsSL "https://api.github.com/repos/${UPSTREAM_REPO}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["default_branch"])')"
+          fi
+          if [ -z "${UPSTREAM_SHA:-}" ]; then
+            UPSTREAM_SHA="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)"
+          fi
+          if [[ ! "$UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve upstream SHA for ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}" >&2
+            exit 1
+          fi
+          echo "UPSTREAM_BRANCH=$UPSTREAM_BRANCH" >> "$CM_ENV"
+          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$CM_ENV"
+          echo "Building ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${UPSTREAM_SHA})"
+
+      - name: Check out Fluxer source (preserving build caches)
+        script: |
+          set -euo pipefail
+          # Preserve restored .dart_tool/{build,hooks_runner} inside src/
+          mkdir -p src
+          if [ ! -d src/.git ]; then
+            git -C src init
+            git -C src remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          else
+            git -C src remote set-url origin "https://github.com/${UPSTREAM_REPO}.git"
+          fi
+          git -C src fetch --depth=1 origin "$UPSTREAM_SHA"
+          git -C src checkout --force FETCH_HEAD
+          git -C src submodule sync --recursive
+          git -C src submodule update --init --recursive
+
+      - name: Set up Rust toolchain for iOS native assets
+        script: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$CM_ENV"
+          rustup target add aarch64-apple-ios
+          (cd src/fluxer && rustup toolchain install && rustup target add aarch64-apple-ios)
+          flutter config --enable-native-assets
+          xcodebuild -version
+          flutter --version
+
+      - name: Configure iOS build & run codegen (build_runner)
+        script: |
+          set -euo pipefail
+          cd src
+          dart tool/configure_build.dart --profile=ios-store
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Build unsigned iOS app (8-core M2)
+        script: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd src
+          flutter build ios --release --no-codesign --no-pub
+
+      - name: Ad-hoc sign & package IPAs (Feather + SideStore)
+        script: |
+          set -euo pipefail
+          bash scripts/package_ipa.sh \
+            "$CM_BUILD_DIR/src/build/ios/iphoneos/Runner.app" \
+            "$CM_BUILD_DIR/build_out" \
+            "$UPSTREAM_SHA"
+    artifacts:
+      - build_out/fluxer-unsigned.ipa
+      - build_out/fluxer-sideload-no-plugins.ipa
+      - build_out/upstream-commit.txt

@@ -5,6 +5,19 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild even if a release already exists for the latest upstream commit
+        type: boolean
+        default: false
+      runner:
+        description: Build backend (auto uses Codemagic 8-core M2 when secrets are set)
+        type: choice
+        default: auto
+        options:
+          - auto
+          - codemagic
+          - github
   schedule:
     - cron: "13 */6 * * *"
 
@@ -23,11 +36,13 @@ jobs:
       branch: ${{ steps.upstream.outputs.branch }}
       sha: ${{ steps.upstream.outputs.sha }}
       update: ${{ steps.upstream.outputs.update }}
+      backend: ${{ steps.backend.outputs.backend }}
     steps:
-      - name: Check upstream main
+      - name: Check upstream default branch
         id: upstream
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild == true }}
         run: |
           set -euo pipefail
           branch="$(gh repo view fluxerapp/flutter_client --json defaultBranchRef --jq '.defaultBranchRef.name')"
@@ -43,7 +58,10 @@ jobs:
             gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
               --json tagName --jq '.[0].tagName // ""'
           )"
-          if [[ "$latest_tag" == "$tag" ]]; then
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild enabled for upstream $branch at $sha."
+          elif [[ "$latest_tag" == "$tag" ]]; then
             echo "update=false" >> "$GITHUB_OUTPUT"
             echo "Upstream $sha already has a release."
           else
@@ -51,12 +69,108 @@ jobs:
             echo "Building upstream $branch at $sha."
           fi
 
-  build:
-    name: Build and publish IPA
+      - name: Select build backend
+        id: backend
+        env:
+          REQUESTED_RUNNER: ${{ inputs.runner || 'auto' }}
+          HAS_CM_TOKEN: ${{ secrets.CODEMAGIC_API_TOKEN != '' }}
+          HAS_CM_APP: ${{ secrets.CODEMAGIC_APP_ID != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_RUNNER" == "github" ]]; then
+            backend="github"
+          elif [[ "$REQUESTED_RUNNER" == "codemagic" ]]; then
+            if [[ "$HAS_CM_TOKEN" != "true" || "$HAS_CM_APP" != "true" ]]; then
+              echo "::error::runner=codemagic requested, but CODEMAGIC_API_TOKEN or CODEMAGIC_APP_ID secret is missing."
+              exit 1
+            fi
+            backend="codemagic"
+          elif [[ "$HAS_CM_TOKEN" == "true" && "$HAS_CM_APP" == "true" ]]; then
+            backend="codemagic"
+          else
+            echo "::notice::Codemagic secrets not configured yet; falling back to GitHub macOS runner."
+            backend="github"
+          fi
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "Selected build backend: $backend"
+
+  build-codemagic:
+    name: Build on Codemagic (8-core M2) & publish IPA
     needs: check-upstream
-    if: needs.check-upstream.outputs.update == 'true'
+    if: needs.check-upstream.outputs.update == 'true' && needs.check-upstream.outputs.backend == 'codemagic'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out builder scripts
+        uses: actions/checkout@v4
+
+      - name: Run Codemagic M2 build (live progress)
+        env:
+          CODEMAGIC_API_TOKEN: ${{ secrets.CODEMAGIC_API_TOKEN }}
+          CODEMAGIC_APP_ID: ${{ secrets.CODEMAGIC_APP_ID }}
+          CODEMAGIC_WORKFLOW_ID: fluxer-ios-unsigned
+          BUILDER_BRANCH: ${{ github.ref_name }}
+          UPSTREAM_BRANCH: ${{ needs.check-upstream.outputs.branch }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+          OUTPUT_DIR: ${{ runner.temp }}/codemagic-out
+        run: python3 scripts/run_codemagic_build.py
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+          OUT_DIR: ${{ runner.temp }}/codemagic-out
+        run: |
+          set -euo pipefail
+          tag="fluxer-$UPSTREAM_SHA"
+          short_sha="${UPSTREAM_SHA:0:12}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Automatically built on Codemagic (8-core Apple M2) from [fluxerapp/flutter_client@$UPSTREAM_SHA](https://github.com/fluxerapp/flutter_client/commit/$UPSTREAM_SHA).
+
+          - \`fluxer-sideload-no-plugins.ipa\` — Recommended for **SideStore** (avoids the 3-App-ID free Apple ID limit) and single-profile **Feather Sign**.
+          - \`fluxer-unsigned.ipa\` — Full bundle including Broadcast, Notification Service, and Share extensions (for paid certs / multi-profile Feather Sign / TrollStore).
+
+          Both IPAs are ad-hoc signed with normalized permissions and thinned to \`arm64\`; sign with your own certificate or sideloading tool before installing.
+          EOF
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
+              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
+          else
+            gh release create "$tag" \
+              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
+              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Fluxer iOS - $short_sha" \
+              --notes-file "$notes_file"
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxer-unsigned-ipas
+          path: |
+            ${{ runner.temp }}/codemagic-out/fluxer-unsigned.ipa
+            ${{ runner.temp }}/codemagic-out/fluxer-sideload-no-plugins.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+  build-github:
+    name: Build on GitHub macOS (fallback) & publish IPA
+    needs: check-upstream
+    if: needs.check-upstream.outputs.update == 'true' && needs.check-upstream.outputs.backend == 'github'
     runs-on: macos-latest
     steps:
+      - name: Check out builder scripts
+        uses: actions/checkout@v4
+
       - name: Check out Fluxer
         uses: actions/checkout@v4
         with:
@@ -74,20 +188,32 @@ jobs:
           channel: stable
           flutter-version: 3.50.0
           cache: true
-          cache-key: ${{ runner.os }}-flutter-3.50.0-${{ hashFiles('src/pubspec.lock') }}
+          cache-key: ${{ runner.os }}-flutter-3.50.0
 
-      - name: Cache CocoaPods and Rust
+      - name: Cache Rust, native assets, and build_runner
         uses: actions/cache@v4
         with:
           path: |
-            ~/Library/Caches/CocoaPods
-            src/ios/Pods
             ~/.cargo/registry
             ~/.cargo/git
-            src/fluxer/target
-          key: ${{ runner.os }}-ios-${{ hashFiles('src/ios/Podfile.lock', 'src/fluxer/Cargo.lock', 'src/fluxer/rust-toolchain.toml') }}
+            ~/.rustup/toolchains
+            src/.dart_tool/build
+            src/.dart_tool/hooks_runner
+          key: ${{ runner.os }}-dart-rust-${{ hashFiles('src/pubspec.lock', 'src/fluxer/Cargo.lock', 'src/fluxer/rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-ios-
+            ${{ runner.os }}-dart-rust-
+
+      - name: Cache Xcode DerivedData, SPM, and CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+            ~/Library/Caches/CocoaPods
+            src/ios/Pods
+          key: ${{ runner.os }}-xcode-spm-${{ hashFiles('src/ios/Podfile.lock', 'src/pubspec.lock', 'src/ios/Runner.xcodeproj/project.pbxproj') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-spm-
 
       - name: Set up Rust native assets
         run: |
@@ -96,55 +222,71 @@ jobs:
           (cd src/fluxer && rustup toolchain install && rustup target add aarch64-apple-ios)
           flutter config --enable-native-assets
 
-      - name: Configure iOS build and fetch dependencies
+      - name: Configure iOS build and run codegen
         working-directory: src
         run: |
           dart tool/configure_build.dart --profile=ios-store
           flutter pub get
-          dart run build_runner build
+          dart run build_runner build --delete-conflicting-outputs
 
       - name: Build unsigned iOS app
         working-directory: src
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --no-codesign --no-pub
 
-      - name: Package unsigned IPA
+      - name: Ad-hoc sign & package IPAs (Feather + SideStore)
         env:
           UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
         run: |
           set -euo pipefail
-          app="src/build/ios/iphoneos/Runner.app"
-          test -d "$app" || { echo "::error::Expected app bundle not found: $app"; exit 1; }
-          if /usr/bin/codesign -dv "$app" 2>&1 | grep -q '^Signature='; then
-            echo "::error::Expected an unsigned app bundle, but a signature was found."
-            exit 1
-          fi
-          package="$RUNNER_TEMP/ipa"
-          mkdir -p "$package/Payload"
-          ditto "$app" "$package/Payload/Runner.app"
-          (cd "$package" && /usr/bin/zip -qry -X "$RUNNER_TEMP/fluxer-unsigned.ipa" Payload)
-          /usr/bin/unzip -Z1 "$RUNNER_TEMP/fluxer-unsigned.ipa" | grep -Fxq 'Payload/Runner.app/Info.plist'
-          echo "Built from fluxerapp/flutter_client@$UPSTREAM_SHA" > "$RUNNER_TEMP/upstream-commit.txt"
+          bash scripts/package_ipa.sh \
+            "src/build/ios/iphoneos/Runner.app" \
+            "$RUNNER_TEMP/ipa-out" \
+            "$UPSTREAM_SHA"
 
-      - name: Publish release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+          OUT_DIR: ${{ runner.temp }}/ipa-out
         run: |
           set -euo pipefail
           tag="fluxer-$UPSTREAM_SHA"
           short_sha="${UPSTREAM_SHA:0:12}"
-          gh release create "$tag" \
-            "$RUNNER_TEMP/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
-            "$RUNNER_TEMP/upstream-commit.txt#upstream-commit.txt" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Fluxer iOS - $short_sha" \
-            --notes "Automatically built from [fluxerapp/flutter_client@$UPSTREAM_SHA](https://github.com/fluxerapp/flutter_client/commit/$UPSTREAM_SHA). The IPA is unsigned and must be signed before installation."
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Automatically built from [fluxerapp/flutter_client@$UPSTREAM_SHA](https://github.com/fluxerapp/flutter_client/commit/$UPSTREAM_SHA).
 
-      - name: Upload workflow artifact
+          - \`fluxer-sideload-no-plugins.ipa\` — Recommended for **SideStore** (avoids the 3-App-ID free Apple ID limit) and single-profile **Feather Sign**.
+          - \`fluxer-unsigned.ipa\` — Full bundle including Broadcast, Notification Service, and Share extensions (for paid certs / multi-profile Feather Sign / TrollStore).
+
+          Both IPAs are ad-hoc signed with normalized permissions and thinned to \`arm64\`; sign with your own certificate or sideloading tool before installing.
+          EOF
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
+              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
+          else
+            gh release create "$tag" \
+              "$OUT_DIR/fluxer-unsigned.ipa#fluxer-unsigned.ipa" \
+              "$OUT_DIR/fluxer-sideload-no-plugins.ipa#fluxer-sideload-no-plugins.ipa" \
+              "$OUT_DIR/upstream-commit.txt#upstream-commit.txt" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Fluxer iOS - $short_sha" \
+              --notes-file "$notes_file"
+          fi
+
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: fluxer-unsigned-ipa
-          path: ${{ runner.temp }}/fluxer-unsigned.ipa
+          name: fluxer-unsigned-ipas
+          path: |
+            ${{ runner.temp }}/ipa-out/fluxer-unsigned.ipa
+            ${{ runner.temp }}/ipa-out/fluxer-sideload-no-plugins.ipa
           if-no-files-found: error
           retention-days: 14
