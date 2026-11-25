@@ -1,7 +1,8 @@
 # Fluxer unsigned iOS builder
 
 This repository automatically builds an **unsigned IPA** from the latest
-`main` commit of [fluxerapp/flutter_client](https://github.com/fluxerapp/flutter_client).
+commit on the default branch of
+[fluxerapp/flutter_client](https://github.com/fluxerapp/flutter_client).
 
 ## Builds and updates
 
@@ -21,5 +22,5 @@ certificates or repository secrets.
 
 The IPA is intentionally unsigned and cannot be installed directly. Sign it
 with your own Apple developer certificate or a compatible sideloading tool
-before installing. It is built from upstream's `main` branch, not an official
+before installing. It is built from upstream's default branch, not an official
 App Store release.

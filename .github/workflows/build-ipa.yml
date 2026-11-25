@@ -20,6 +20,7 @@ jobs:
     name: Check for upstream changes
     runs-on: ubuntu-latest
     outputs:
+      branch: ${{ steps.upstream.outputs.branch }}
       sha: ${{ steps.upstream.outputs.sha }}
       update: ${{ steps.upstream.outputs.update }}
     steps:
@@ -29,12 +30,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha="$(git ls-remote https://github.com/fluxerapp/flutter_client.git refs/heads/main | cut -f1)"
+          branch="$(gh repo view fluxerapp/flutter_client --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          sha="$(git ls-remote https://github.com/fluxerapp/flutter_client.git "refs/heads/$branch" | cut -f1)"
           if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Could not resolve upstream main commit."
+            echo "::error::Could not resolve the upstream default branch ($branch)."
             exit 1
           fi
           tag="fluxer-$sha"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           latest_tag="$(
             gh release list --repo "$GITHUB_REPOSITORY" --limit 1 \
@@ -45,7 +48,7 @@ jobs:
             echo "Upstream $sha already has a release."
           else
             echo "update=true" >> "$GITHUB_OUTPUT"
-            echo "Building upstream $sha."
+            echo "Building upstream $branch at $sha."
           fi
 
   build:
